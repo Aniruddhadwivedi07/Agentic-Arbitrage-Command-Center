@@ -114,7 +114,15 @@ class ArbitrageEngine:
 
         # ── Control Flags ──
         self._shutdown = asyncio.Event()
-        self._ws_available: bool = False  # set True if ccxt.pro watch works
+
+        # Per-exchange transport mode tracking.
+        # Starts as "ws" (optimistic); degrades to "rest" on NotSupported.
+        self._transport_mode: dict[str, str] = {
+            self.cfg.exchange_a_id: "ws",
+            self.cfg.exchange_b_id: "ws",
+        }
+        # Set of exchange IDs whose WS probe has already completed (pass or fail).
+        self._ws_probed: set[str] = set()
 
     # ═══════════════════════════════════════════════════════════════════
     # Lifecycle
@@ -156,72 +164,181 @@ class ArbitrageEngine:
 
     # ═══════════════════════════════════════════════════════════════════
     # Task 1 — Market Sync  (watch_market_spread)
+    #
+    # Uses a PER-EXCHANGE adaptive transport model:
+    #   • Each exchange starts optimistically in "ws" mode.
+    #   • On the first tick, a real watch_order_book() call is attempted.
+    #   • If the exchange throws NotSupported (or any fatal, non-transient
+    #     error), that *single* exchange is permanently degraded to "rest"
+    #     mode while the other may continue streaming over WebSocket.
+    #   • Transient network errors (timeouts, disconnects) trigger a
+    #     short backoff + retry without degrading the transport mode.
+    #   • Both paths produce identical TickerSnapshot / SpreadResult
+    #     data, so the downstream FSM is transport-agnostic.
     # ═══════════════════════════════════════════════════════════════════
+
+    # Exception types that signal "this exchange will NEVER support WS".
+    # ccxt.NotSupported is the canonical one; we also catch AttributeError
+    # for older ccxt builds where the method isn't even defined.
+    _WS_FATAL_ERRORS = (
+        getattr(ccxt_async, "NotSupported", type(None)),
+        AttributeError,
+    )
 
     async def _watch_market_spread(self) -> None:
         """
-        Stream or poll the top-of-book for both exchanges and recompute
-        the cross-venue spread on every tick.
+        Coordinator loop.  Launches two independent per-exchange fetch
+        tasks that each auto-negotiate their own transport (WS or REST).
+        Both tasks write into their respective TickerSnapshot; a shared
+        asyncio.Event is set whenever *either* exchange delivers new data
+        so the spread can be recomputed promptly.
         """
-        # Attempt WebSocket streaming first (ccxt.pro path).
-        if await self._probe_ws():
-            self._ws_available = True
-            self.tel.status("WebSocket streaming available — using watch_order_book().")
-            await self._ws_market_loop()
-        else:
-            self.tel.status("WebSocket unavailable — falling back to REST polling.")
-            await self._rest_market_loop()
+        assert self._ex_a is not None and self._ex_b is not None
 
-    async def _probe_ws(self) -> bool:
-        """Return True if both exchanges support watch_order_book."""
-        return (
-            hasattr(self._ex_a, "watch_order_book")
-            and hasattr(self._ex_b, "watch_order_book")
-        )
+        # Event pulsed by each fetcher after it updates its TickerSnapshot.
+        tick_event = asyncio.Event()
 
-    async def _ws_market_loop(self) -> None:
-        """Dual-WebSocket order book streaming loop."""
-        assert self._ex_a and self._ex_b
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(
+                self._fetch_single_exchange(
+                    exchange=self._ex_a,
+                    exchange_id=self.cfg.exchange_a_id,
+                    ticker=self._ticker_a,
+                    tick_event=tick_event,
+                ),
+                name=f"fetch_{self.cfg.exchange_a_id}",
+            )
+            tg.create_task(
+                self._fetch_single_exchange(
+                    exchange=self._ex_b,
+                    exchange_id=self.cfg.exchange_b_id,
+                    ticker=self._ticker_b,
+                    tick_event=tick_event,
+                ),
+                name=f"fetch_{self.cfg.exchange_b_id}",
+            )
+            tg.create_task(
+                self._spread_aggregator(tick_event),
+                name="spread_aggregator",
+            )
+
+    async def _fetch_single_exchange(
+        self,
+        exchange: ccxt_async.Exchange,
+        exchange_id: str,
+        ticker: TickerSnapshot,
+        tick_event: asyncio.Event,
+    ) -> None:
+        """
+        Autonomous per-exchange data fetcher.
+
+        1.  If ``_transport_mode[exchange_id]`` is ``"ws"``, attempt a
+            real ``watch_order_book()`` call.
+        2.  If the very first call raises a *fatal* WS error
+            (``NotSupported``, ``AttributeError``), permanently degrade
+            that exchange to ``"rest"`` and log a WARNING.
+        3.  In ``"rest"`` mode, poll ``fetch_order_book()`` at the
+            configured ``poll_interval_s`` cadence with full
+            ``asyncio.sleep`` between ticks to avoid rate-limit bans.
+        4.  Transient errors (network glitches, timeouts) in either mode
+            trigger a brief backoff but do NOT change the transport mode.
+        """
         sym = self.cfg.symbol
+
         while not self._shutdown.is_set():
+            mode = self._transport_mode[exchange_id]
+
+            # ── WebSocket path ──────────────────────────────────────
+            if mode == "ws":
+                try:
+                    ob = await exchange.watch_order_book(sym, limit=5)
+                    self._update_ticker_from_ob(ob, ticker, exchange_id)
+                    tick_event.set()
+
+                    # Mark the probe as successful on first WS tick.
+                    if exchange_id not in self._ws_probed:
+                        self._ws_probed.add(exchange_id)
+                        self.tel.status(
+                            f"{exchange_id.upper()}: WebSocket streaming "
+                            f"active — watch_order_book() confirmed.",
+                            exchange=exchange_id,
+                            transport="ws",
+                        )
+                    continue  # WS is push-based; loop immediately.
+
+                except self._WS_FATAL_ERRORS as exc:
+                    # ── Permanent degradation ───────────────────────
+                    self._transport_mode[exchange_id] = "rest"
+                    self._ws_probed.add(exchange_id)
+                    self.tel.warning(
+                        f"{exchange_id.upper()}: watch_order_book() is "
+                        f"not supported ({type(exc).__name__}: {exc}). "
+                        f"Degrading to REST polling at "
+                        f"{self.cfg.poll_interval_s}s intervals.",
+                        exchange=exchange_id,
+                        transport="rest",
+                        error=str(exc),
+                    )
+                    # Fall through to the REST branch below on this
+                    # same iteration — no data was lost.
+
+                except Exception as exc:
+                    # ── Transient error — backoff + retry ──────────
+                    self.tel.warning(
+                        f"{exchange_id.upper()}: WebSocket transient "
+                        f"error ({type(exc).__name__}: {exc}). "
+                        f"Retrying in {self.cfg.ws_reconnect_delay_s}s.",
+                        exchange=exchange_id,
+                        transport="ws",
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(self.cfg.ws_reconnect_delay_s)
+                    continue
+
+            # ── REST polling path ───────────────────────────────────
+            # Reached either because mode was already "rest", or because
+            # the WS branch just degraded on this iteration.
             try:
-                # Run both watches concurrently.
-                ob_a, ob_b = await asyncio.gather(
-                    self._ex_a.watch_order_book(sym, limit=5),
-                    self._ex_b.watch_order_book(sym, limit=5),
-                )
-                self._update_ticker_from_ob(ob_a, self._ticker_a, self.cfg.exchange_a_id)
-                self._update_ticker_from_ob(ob_b, self._ticker_b, self.cfg.exchange_b_id)
-                self._compute_spread()
-                self._scan_count += 1
+                ob = await exchange.fetch_order_book(sym, limit=5)
+                self._update_ticker_from_ob(ob, ticker, exchange_id)
+                tick_event.set()
             except Exception as exc:
                 self.tel.warning(
-                    f"WebSocket error: {exc}. Reconnecting in "
-                    f"{self.cfg.ws_reconnect_delay_s}s.",
+                    f"{exchange_id.upper()}: REST fetch error "
+                    f"({type(exc).__name__}: {exc}).",
+                    exchange=exchange_id,
+                    transport="rest",
                     error=str(exc),
                 )
-                await asyncio.sleep(self.cfg.ws_reconnect_delay_s)
 
-    async def _rest_market_loop(self) -> None:
-        """REST polling fallback for exchanges without WebSocket support."""
-        assert self._ex_a and self._ex_b
-        sym = self.cfg.symbol
-        while not self._shutdown.is_set():
-            try:
-                ob_a, ob_b = await asyncio.gather(
-                    self._ex_a.fetch_order_book(sym, limit=5),
-                    self._ex_b.fetch_order_book(sym, limit=5),
-                )
-                self._update_ticker_from_ob(ob_a, self._ticker_a, self.cfg.exchange_a_id)
-                self._update_ticker_from_ob(ob_b, self._ticker_b, self.cfg.exchange_b_id)
-                self._compute_spread()
-                self._scan_count += 1
-            except Exception as exc:
-                self.tel.warning(
-                    f"REST fetch error: {exc}",
-                    error=str(exc),
-                )
+            # Rate-limit-safe sleep.  Completely non-blocking.
             await asyncio.sleep(self.cfg.poll_interval_s)
+
+    async def _spread_aggregator(self, tick_event: asyncio.Event) -> None:
+        """
+        Waits for either exchange fetcher to deliver new data (via
+        *tick_event*), then recomputes the cross-venue spread.
+
+        Runs as a dedicated task so that spread computation is decoupled
+        from the per-exchange fetch cadence.
+        """
+        while not self._shutdown.is_set():
+            # Block until at least one fetcher signals new data.
+            try:
+                await asyncio.wait_for(tick_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # No data in 5 s — emit a warning but keep waiting.
+                if self._scan_count > 0:  # suppress on cold start
+                    self.tel.warning(
+                        "No market data received in 5 s — exchanges may "
+                        "be unreachable.",
+                    )
+                continue
+            finally:
+                tick_event.clear()
+
+            self._compute_spread()
+            self._scan_count += 1
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -266,16 +383,22 @@ class ArbitrageEngine:
 
         # Emit a SCAN telemetry event every Nth tick to avoid flooding.
         if self._scan_count % 10 == 0:
+            mode_a = self._transport_mode.get(self.cfg.exchange_a_id, "?")
+            mode_b = self._transport_mode.get(self.cfg.exchange_b_id, "?")
             self.tel.scan(
                 f"{self.cfg.symbol} spread: "
-                f"{self.cfg.exchange_a_id.upper()} ask {a.best_ask:.2f}, "
-                f"{self.cfg.exchange_b_id.upper()} bid {b.best_bid:.2f}. "
+                f"{self.cfg.exchange_a_id.upper()} ask {a.best_ask:.2f} "
+                f"[{mode_a.upper()}], "
+                f"{self.cfg.exchange_b_id.upper()} bid {b.best_bid:.2f} "
+                f"[{mode_b.upper()}]. "
                 f"Spread: ${s.best_spread:.2f} ({s.spread_pct:.4f}%). "
                 f"Scans: {self._scan_count}.",
                 spread_usd=round(s.best_spread, 4),
                 spread_pct=round(s.spread_pct, 6),
                 ask_a=a.best_ask,
                 bid_b=b.best_bid,
+                transport_a=mode_a,
+                transport_b=mode_b,
             )
 
     # ═══════════════════════════════════════════════════════════════════
