@@ -17,94 +17,21 @@
   // ═══════════════════════════════════════
   const logsContainer = document.getElementById('logsContainer');
 
-  const initialLogs = [
-    {
-      time: '14:28:14',
-      agent: 'AGENT_01',
-      action: 'status',
-      actionLabel: 'STATUS',
-      message: 'System initialized. Monitoring <hl>BTC/USDT</hl> funding rates across <num>12</num> venues.'
-    },
-    {
-      time: '14:29:02',
-      agent: 'AGENT_01',
-      action: 'scan',
-      actionLabel: 'SCAN',
-      message: 'Scanning funding rate differentials... <num>7,411</num> opportunities analyzed in last 24h.'
-    },
-    {
-      time: '14:30:15',
-      agent: 'AGENT_01',
-      action: 'scan',
-      actionLabel: 'SCAN',
-      message: 'BTC/USDT rate check — Binance: <num>0.028%</num>, Bybit: <num>0.009%</num>. Spread: <num>0.019%</num>. Below threshold.'
-    },
-    {
-      time: '14:31:22',
-      agent: 'AGENT_01',
-      action: 'scan',
-      actionLabel: 'SCAN',
-      message: 'ETH/USDT rate check — Binance: <num>0.022%</num>, OKX: <num>0.018%</num>. Spread: <num>0.004%</num>. Insufficient.'
-    },
-    {
-      time: '14:32:01',
-      agent: 'AGENT_01',
-      action: 'scan',
-      actionLabel: 'SCAN',
-      message: 'BTC/USDT Funding Rate disparity detected. Binance: <num>0.031%</num>, Bybit: <num>0.008%</num> (Spread: <hl>0.023%</hl>). Threshold (<num>0.015%</num>) Met.'
-    },
-    {
-      time: '14:32:03',
-      agent: 'AGENT_01',
-      action: 'analyze',
-      actionLabel: 'ANALYZING',
-      message: 'Market depth verified, volatility nominal, execution risk &lt; <num>10%</num>. Optimal conditions confirmed.'
-    },
-    {
-      time: '14:32:05',
-      agent: 'AGENT_01',
-      action: 'orchestrate',
-      actionLabel: 'ORCHESTRATION',
-      message: 'Initiating <num>3 BTC</num> arbitrage cycle. Strategy: <hl>Long Bybit (Receiver)</hl>, <hl>Short Binance (Payer)</hl>.'
-    },
-    {
-      time: '14:32:07',
-      agent: 'AGENT_01',
-      action: 'execute',
-      actionLabel: 'EXECUTING',
-      message: 'Placing orders. <num>3 BTC</num> Long @ Bybit (<num>68201.5</num>), <num>3 BTC</num> Short @ Binance (<num>68205.2</num>).'
-    },
-    {
-      time: '14:32:08',
-      agent: 'AGENT_01',
-      action: 'confirm',
-      actionLabel: 'CONFIRMATION',
-      message: 'Positions active. <hl>3 BTC Cycle Initiated</hl>. Monitoring delta exposure.'
-    },
-    {
-      time: '14:32:12',
-      agent: 'AGENT_01',
-      action: 'status',
-      actionLabel: 'STATUS',
-      message: 'Delta neutral. Net exposure: <num>0.0002 BTC</num>. Monitoring position health.'
-    },
-    {
-      time: '14:35:44',
-      agent: 'AGENT_01',
-      action: 'status',
-      actionLabel: 'STATUS',
-      message: 'Position health check: P&L <hl>+$12.40</hl>, Funding accrual <hl>+$8.20</hl>. Delta within bounds.'
-    },
-    {
-      time: '14:40:18',
-      agent: 'AGENT_01',
-      action: 'scan',
-      actionLabel: 'SCAN',
-      message: 'Continuous scan active. Next funding in <num>3h 19m</num>. Rate convergence: <num>0.018%</num>.'
-    },
-  ];
+  const initialLogs = []; // Intentionally left empty as we use SYNC_HISTORY now.
+  
+  function formatLogEntry(log) {
+    let msg = log.message || '';
+    // Replace <hl> tags with highlight spans
+    msg = msg.replace(/<hl>(.*?)<\/hl>/g, '<span class="log-highlight">$1</span>');
+    msg = msg.replace(/<num>(.*?)<\/num>/g, '<span class="log-number">$1</span>');
 
-  renderInitialLogs();
+    return `<div class="log-entry">` +
+      `<span class="log-timestamp">[${log.time} UTC]</span> ` +
+      `<span class="log-agent">[${log.agent}]</span> ` +
+      `<span class="log-action ${log.action}">${log.actionLabel}:</span> ` +
+      `<span class="log-message">${msg}</span>` +
+      `</div>`;
+  }
 
   // ═══════════════════════════════════════
   // WEBSOCKET CONNECTION TO PYTHON ENGINE
