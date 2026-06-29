@@ -135,104 +135,134 @@
 
   ws.onmessage = (event) => {
     try {
-      const data = JSON.parse(event.data);
+      const msg = JSON.parse(event.data);
       
-      // 1. Append Log
-      const actionMap = {
-        'SCAN': 'scan',
-        'ANALYZE': 'analyze',
-        'EXECUTE': 'execute',
-        'STATUS': 'status',
-        'WARNING': 'warning'
-      };
-      
-      const actionClass = actionMap[data.level] || 'status';
-      const logEntry = {
-        time: data.timestamp ? data.timestamp.substr(11, 8) : new Date().toISOString().substr(11, 8),
-        agent: data.agent || 'AGENT_01',
-        action: actionClass,
-        actionLabel: data.level || 'INFO',
-        message: data.message
-      };
-      addLiveLog(logEntry);
-
-      // 2. Global Stats Update (from STATUS)
-      if (data.level === 'STATUS' && data.metrics) {
-        if (data.metrics.total_scans !== undefined) {
-          document.getElementById('oppsScanned').textContent = data.metrics.total_scans.toLocaleString();
-        }
-        if (data.metrics.total_executions !== undefined) {
-          document.getElementById('executions').textContent = data.metrics.total_executions.toLocaleString();
-        }
-        if (data.metrics.session_pnl !== undefined) {
-          const pnl = data.metrics.session_pnl;
-          const pnlEl = document.getElementById('dailyPnl');
-          pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
-          pnlEl.className = 'stat-card-value ' + (pnl >= 0 ? 'positive' : 'negative');
-        }
+      if (msg.type === 'SYNC_HISTORY') {
+        logsContainer.innerHTML = '';
+        positionsBody.innerHTML = '';
+        positions = msg.positions || [];
+        
+        (msg.logs || []).forEach(logData => {
+          processLiveMessage(logData, true);
+        });
+        
+        // Re-add cursor after bulk insert
+        const cursorSpan = document.createElement('span');
+        cursorSpan.className = 'log-cursor';
+        logsContainer.appendChild(cursorSpan);
+        logsContainer.scrollTop = logsContainer.scrollHeight;
+        
+        renderPositions();
+      } else if (msg.type === 'LIVE_STREAM') {
+        processLiveMessage(msg.data, false);
+      } else {
+        processLiveMessage(msg, false); // Fallback
       }
-
-      // Update Ticker with live spread from SCAN
-      if (data.level === 'SCAN' && data.metrics && data.metrics.spread_pct !== undefined) {
-        const spreadPct = data.metrics.spread_pct;
-        const changeEl = document.getElementById('btcChange');
-        changeEl.textContent = 'Spread: ' + spreadPct.toFixed(4) + '%';
-        changeEl.className = 'ticker-change ' + (spreadPct > 0.015 ? 'positive' : '');
-      }
-
-      // 3. Dynamic Positions Table Update (from EXECUTE)
-      if (data.level === 'EXECUTE' && data.metrics) {
-        const m = data.metrics;
-        
-        // Step 1: Orchestration Phase
-        if (m.buy_exchange && m.sell_exchange) {
-          pendingExecution.buy_exchange = m.buy_exchange;
-          pendingExecution.sell_exchange = m.sell_exchange;
-          pendingExecution.size = m.size;
-        }
-        
-        // Step 2: Execution Phase (Fills)
-        if (m.buy_price && m.sell_price) {
-          pendingExecution.buy_price = m.buy_price;
-          pendingExecution.sell_price = m.sell_price;
-        }
-        
-        // Step 3: Confirmation Phase (Cycle created)
-        if (m.cycle_id !== undefined && m.pnl === 0.0) {
-          pendingExecution.cycle_id = m.cycle_id;
-          pendingExecution.opened_at = new Date();
-          positions.push({
-            id: pendingExecution.cycle_id,
-            asset: 'ETH/USDT', // Based on script arg
-            pair: `${pendingExecution.buy_exchange.substring(0,3)} — ${pendingExecution.sell_exchange.substring(0,3)}`,
-            strategy: 'Funding Rate',
-            sideLong: `Long ${pendingExecution.buy_exchange}`,
-            sideShort: `Short ${pendingExecution.sell_exchange}`,
-            size: `${pendingExecution.size} ETH`,
-            entryBuy: pendingExecution.buy_price || 0,
-            entrySell: pendingExecution.sell_price || 0,
-            markPrice: pendingExecution.buy_price || 0,
-            netPnl: 0,
-            netPnlPct: 0,
-            fundingPnl: 0,
-            openedAt: Date.now()
-          });
-          pendingExecution = {}; // reset
-          renderPositions();
-        }
-        
-        // Step 4: Liquidation / Closing Phase
-        if (m.cycle_id !== undefined && m.pnl !== undefined && m.cumulative_pnl !== undefined) {
-          // Remove the position
-          positions = positions.filter(p => p.id !== m.cycle_id);
-          renderPositions();
-        }
-      }
-
     } catch (e) {
       console.error("Error processing WS message:", e);
     }
   };
+
+  function processLiveMessage(data, isSync) {
+    // 1. Append Log
+    const actionMap = {
+      'SCAN': 'scan',
+      'ANALYZE': 'analyze',
+      'EXECUTE': 'execute',
+      'STATUS': 'status',
+      'WARNING': 'warning'
+    };
+    
+    const actionClass = actionMap[data.level] || 'status';
+    const logEntry = {
+      time: data.timestamp ? data.timestamp.substr(11, 8) : new Date().toISOString().substr(11, 8),
+      agent: data.agent || 'AGENT_01',
+      action: actionClass,
+      actionLabel: data.level || 'INFO',
+      message: data.message
+    };
+    
+    if (isSync) {
+      const div = document.createElement('div');
+      div.innerHTML = formatLogEntry(logEntry);
+      logsContainer.appendChild(div.firstElementChild);
+    } else {
+      addLiveLog(logEntry);
+    }
+
+    // 2. Global Stats Update (from STATUS)
+    if (data.level === 'STATUS' && data.metrics) {
+      if (data.metrics.total_scans !== undefined) {
+        document.getElementById('oppsScanned').textContent = data.metrics.total_scans.toLocaleString();
+      }
+      if (data.metrics.total_executions !== undefined) {
+        document.getElementById('executions').textContent = data.metrics.total_executions.toLocaleString();
+      }
+      if (data.metrics.session_pnl !== undefined) {
+        const pnl = data.metrics.session_pnl;
+        const pnlEl = document.getElementById('dailyPnl');
+        pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+        pnlEl.className = 'stat-card-value ' + (pnl >= 0 ? 'positive' : 'negative');
+      }
+    }
+
+    // Update Ticker with live spread from SCAN
+    if (data.level === 'SCAN' && data.metrics && data.metrics.spread_pct !== undefined) {
+      const spreadPct = data.metrics.spread_pct;
+      const changeEl = document.getElementById('btcChange');
+      changeEl.textContent = 'Spread: ' + spreadPct.toFixed(4) + '%';
+      changeEl.className = 'ticker-change ' + (spreadPct > 0.015 ? 'positive' : '');
+    }
+
+    // 3. Dynamic Positions Table Update (from EXECUTE)
+    if (!isSync && data.level === 'EXECUTE' && data.metrics) {
+      const m = data.metrics;
+      
+      // Step 1: Orchestration Phase
+      if (m.buy_exchange && m.sell_exchange) {
+        pendingExecution.buy_exchange = m.buy_exchange;
+        pendingExecution.sell_exchange = m.sell_exchange;
+        pendingExecution.size = m.size;
+      }
+      
+      // Step 2: Execution Phase (Fills)
+      if (m.buy_price && m.sell_price) {
+        pendingExecution.buy_price = m.buy_price;
+        pendingExecution.sell_price = m.sell_price;
+      }
+      
+      // Step 3: Confirmation Phase (Cycle created)
+      if (m.cycle_id !== undefined && m.pnl === 0.0) {
+        pendingExecution.cycle_id = m.cycle_id;
+        pendingExecution.opened_at = new Date();
+        positions.push({
+          id: pendingExecution.cycle_id,
+          asset: 'ETH/USDT', // Based on script arg
+          pair: `${pendingExecution.buy_exchange.substring(0,3)} — ${pendingExecution.sell_exchange.substring(0,3)}`,
+          strategy: 'Funding Rate',
+          sideLong: `Long ${pendingExecution.buy_exchange}`,
+          sideShort: `Short ${pendingExecution.sell_exchange}`,
+          size: `${pendingExecution.size} ETH`,
+          entryBuy: pendingExecution.buy_price || 0,
+          entrySell: pendingExecution.sell_price || 0,
+          markPrice: pendingExecution.buy_price || 0,
+          netPnl: 0,
+          netPnlPct: 0,
+          fundingPnl: 0,
+          openedAt: Date.now()
+        });
+        pendingExecution = {}; // reset
+        renderPositions();
+      }
+      
+      // Step 4: Liquidation / Closing Phase
+      if (m.cycle_id !== undefined && m.pnl !== undefined && m.cumulative_pnl !== undefined) {
+        // Remove the position
+        positions = positions.filter(p => p.id !== m.cycle_id);
+        renderPositions();
+      }
+    }
+  }
 
   function addLiveLog(log) {
     const cursor = logsContainer.querySelector('.log-cursor');
