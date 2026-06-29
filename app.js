@@ -104,118 +104,137 @@
     },
   ];
 
-  // Additional log templates for live simulation
-  const liveLogTemplates = [
-    {
-      action: 'scan',
-      actionLabel: 'SCAN',
-      messages: [
-        'BTC/USDT rate check — Binance: <num>{rate1}%</num>, Bybit: <num>{rate2}%</num>. Spread: <num>{spread}%</num>. {verdict}',
-        'Cross-venue scan complete. <num>{venues}</num> venues checked. No actionable spread detected.',
-        'ETH/USDT Binance: <num>{rate1}%</num>, OKX: <num>{rate2}%</num>. Spread: <num>{spread}%</num>. Monitoring.',
-        'SOL/USDT rate differential: <num>{spread}%</num>. Below threshold. Skipping.',
-        'Funding countdown: <num>{timer}</num> until next settlement. Current spread: <num>{spread}%</num>.',
-      ]
-    },
-    {
+  renderInitialLogs();
+
+  // ═══════════════════════════════════════
+  // WEBSOCKET CONNECTION TO PYTHON ENGINE
+  // ═══════════════════════════════════════
+  const ws = new WebSocket('ws://localhost:8080');
+
+  let pendingExecution = {};
+
+  ws.onopen = () => {
+    addLiveLog({
+      time: new Date().toISOString().substr(11, 8),
+      agent: 'SYSTEM',
       action: 'status',
-      actionLabel: 'STATUS',
-      messages: [
-        'Position health: P&L <hl>+${pnl}</hl>, Funding accrual <hl>+${funding}</hl>. All systems nominal.',
-        'Delta exposure: <num>{delta} BTC</num>. Within risk parameters. No rebalance needed.',
-        'Heartbeat OK. Latency — Binance: <num>{lat1}ms</num>, Bybit: <num>{lat2}ms</num>. Connections stable.',
-        'Risk monitor: Portfolio VaR <num>{var}%</num>. Max drawdown today: <num>{dd}%</num>.',
-        'Memory usage nominal. <num>{opps}</num> opportunities processed this cycle.',
-      ]
-    },
-    {
-      action: 'analyze',
-      actionLabel: 'ANALYZING',
-      messages: [
-        'Order book depth analysis: Binance bid stack <num>{depth1} BTC</num>, Bybit ask stack <num>{depth2} BTC</num>.',
-        'Volatility regime: <hl>{regime}</hl>. Adjusting position size parameters.',
-        'Fee optimization: Maker fee <num>{fee}%</num>. Estimated execution cost: <num>${cost}</num>.',
-        'Correlation check: BTC-ETH <num>{corr}</num>. Cross-asset risk: nominal.',
-      ]
-    },
-    {
+      actionLabel: 'CONNECTED',
+      message: 'WebSocket bridge established. Listening to Python engine telemetry.'
+    });
+  };
+
+  ws.onclose = () => {
+    addLiveLog({
+      time: new Date().toISOString().substr(11, 8),
+      agent: 'SYSTEM',
       action: 'warning',
-      actionLabel: 'WARNING',
-      messages: [
-        'Latency spike detected on Bybit WebSocket: <num>{lat}ms</num>. Monitoring.',
-        'Funding spread narrowing. Current: <num>{spread}%</num>. Close to threshold.',
-        'Rate limit approaching on Binance API. <num>{remaining}</num> requests remaining.',
-      ]
-    },
-  ];
+      actionLabel: 'DISCONNECTED',
+      message: 'WebSocket bridge closed. Engine offline.'
+    });
+  };
 
-  function formatLogEntry(log) {
-    let msg = log.message;
-    // Replace <hl> tags with highlight spans
-    msg = msg.replace(/<hl>(.*?)<\/hl>/g, '<span class="log-highlight">$1</span>');
-    msg = msg.replace(/<num>(.*?)<\/num>/g, '<span class="log-number">$1</span>');
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      
+      // 1. Append Log
+      const actionMap = {
+        'SCAN': 'scan',
+        'ANALYZE': 'analyze',
+        'EXECUTE': 'execute',
+        'STATUS': 'status',
+        'WARNING': 'warning'
+      };
+      
+      const actionClass = actionMap[data.level] || 'status';
+      const logEntry = {
+        time: data.timestamp ? data.timestamp.substr(11, 8) : new Date().toISOString().substr(11, 8),
+        agent: data.agent || 'AGENT_01',
+        action: actionClass,
+        actionLabel: data.level || 'INFO',
+        message: data.message
+      };
+      addLiveLog(logEntry);
 
-    return `<div class="log-entry">` +
-      `<span class="log-timestamp">[${log.time} UTC]</span> ` +
-      `<span class="log-agent">[${log.agent}]</span> ` +
-      `<span class="log-action ${log.action}">${log.actionLabel}:</span> ` +
-      `<span class="log-message">${msg}</span>` +
-      `</div>`;
-  }
+      // 2. Global Stats Update (from STATUS)
+      if (data.level === 'STATUS' && data.metrics) {
+        if (data.metrics.total_scans !== undefined) {
+          document.getElementById('oppsScanned').textContent = data.metrics.total_scans.toLocaleString();
+        }
+        if (data.metrics.total_executions !== undefined) {
+          document.getElementById('executions').textContent = data.metrics.total_executions.toLocaleString();
+        }
+        if (data.metrics.session_pnl !== undefined) {
+          const pnl = data.metrics.session_pnl;
+          const pnlEl = document.getElementById('dailyPnl');
+          pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+          pnlEl.className = 'stat-card-value ' + (pnl >= 0 ? 'positive' : 'negative');
+        }
+      }
 
-  function renderInitialLogs() {
-    let html = '';
-    for (const log of initialLogs) {
-      html += formatLogEntry(log);
+      // Update Ticker with live spread from SCAN
+      if (data.level === 'SCAN' && data.metrics && data.metrics.spread_pct !== undefined) {
+        const spreadPct = data.metrics.spread_pct;
+        const changeEl = document.getElementById('btcChange');
+        changeEl.textContent = 'Spread: ' + spreadPct.toFixed(4) + '%';
+        changeEl.className = 'ticker-change ' + (spreadPct > 0.015 ? 'positive' : '');
+      }
+
+      // 3. Dynamic Positions Table Update (from EXECUTE)
+      if (data.level === 'EXECUTE' && data.metrics) {
+        const m = data.metrics;
+        
+        // Step 1: Orchestration Phase
+        if (m.buy_exchange && m.sell_exchange) {
+          pendingExecution.buy_exchange = m.buy_exchange;
+          pendingExecution.sell_exchange = m.sell_exchange;
+          pendingExecution.size = m.size;
+        }
+        
+        // Step 2: Execution Phase (Fills)
+        if (m.buy_price && m.sell_price) {
+          pendingExecution.buy_price = m.buy_price;
+          pendingExecution.sell_price = m.sell_price;
+        }
+        
+        // Step 3: Confirmation Phase (Cycle created)
+        if (m.cycle_id !== undefined && m.pnl === 0.0) {
+          pendingExecution.cycle_id = m.cycle_id;
+          pendingExecution.opened_at = new Date();
+          positions.push({
+            id: pendingExecution.cycle_id,
+            asset: 'ETH/USDT', // Based on script arg
+            pair: `${pendingExecution.buy_exchange.substring(0,3)} — ${pendingExecution.sell_exchange.substring(0,3)}`,
+            strategy: 'Funding Rate',
+            sideLong: `Long ${pendingExecution.buy_exchange}`,
+            sideShort: `Short ${pendingExecution.sell_exchange}`,
+            size: `${pendingExecution.size} ETH`,
+            entryBuy: pendingExecution.buy_price || 0,
+            entrySell: pendingExecution.sell_price || 0,
+            markPrice: pendingExecution.buy_price || 0,
+            netPnl: 0,
+            netPnlPct: 0,
+            fundingPnl: 0,
+            openedAt: Date.now()
+          });
+          pendingExecution = {}; // reset
+          renderPositions();
+        }
+        
+        // Step 4: Liquidation / Closing Phase
+        if (m.cycle_id !== undefined && m.pnl !== undefined && m.cumulative_pnl !== undefined) {
+          // Remove the position
+          positions = positions.filter(p => p.id !== m.cycle_id);
+          renderPositions();
+        }
+      }
+
+    } catch (e) {
+      console.error("Error processing WS message:", e);
     }
-    html += '<span class="log-cursor"></span>';
-    logsContainer.innerHTML = html;
-    logsContainer.scrollTop = logsContainer.scrollHeight;
-  }
+  };
 
-  function generateLiveLog() {
-    const template = liveLogTemplates[Math.floor(Math.random() * liveLogTemplates.length)];
-    const msgTemplate = template.messages[Math.floor(Math.random() * template.messages.length)];
-
-    const now = new Date();
-    const time = now.toISOString().substr(11, 8);
-
-    // Fill in template values
-    let message = msgTemplate
-      .replace('{rate1}', (Math.random() * 0.03 + 0.01).toFixed(3))
-      .replace('{rate2}', (Math.random() * 0.02 + 0.005).toFixed(3))
-      .replace('{spread}', (Math.random() * 0.025 + 0.002).toFixed(3))
-      .replace('{verdict}', Math.random() > 0.7 ? '<hl>Approaching threshold</hl>.' : 'Below threshold.')
-      .replace('{venues}', Math.floor(Math.random() * 4 + 8))
-      .replace('{timer}', `${Math.floor(Math.random() * 4)}h ${Math.floor(Math.random() * 59)}m`)
-      .replace('{pnl}', (Math.random() * 40 + 10).toFixed(2))
-      .replace('{funding}', (Math.random() * 20 + 5).toFixed(2))
-      .replace('{delta}', (Math.random() * 0.001).toFixed(4))
-      .replace('{lat1}', Math.floor(Math.random() * 20 + 8))
-      .replace('{lat2}', Math.floor(Math.random() * 30 + 12))
-      .replace('{var}', (Math.random() * 2 + 0.5).toFixed(2))
-      .replace('{dd}', (Math.random() * 0.5 + 0.1).toFixed(2))
-      .replace('{opps}', Math.floor(Math.random() * 200 + 50))
-      .replace('{depth1}', (Math.random() * 50 + 20).toFixed(1))
-      .replace('{depth2}', (Math.random() * 40 + 15).toFixed(1))
-      .replace('{regime}', ['Low Volatility', 'Normal', 'Elevated', 'Trending'][Math.floor(Math.random() * 4)])
-      .replace('{fee}', (Math.random() * 0.02 + 0.01).toFixed(3))
-      .replace('{cost}', (Math.random() * 5 + 1).toFixed(2))
-      .replace('{corr}', (Math.random() * 0.3 + 0.6).toFixed(3))
-      .replace('{lat}', Math.floor(Math.random() * 200 + 150))
-      .replace('{remaining}', Math.floor(Math.random() * 500 + 200));
-
-    return {
-      time: time,
-      agent: 'AGENT_01',
-      action: template.action,
-      actionLabel: template.actionLabel,
-      message: message
-    };
-  }
-
-  function addLiveLog() {
-    const log = generateLiveLog();
+  function addLiveLog(log) {
     const cursor = logsContainer.querySelector('.log-cursor');
     if (cursor) cursor.remove();
 
@@ -237,66 +256,12 @@
     logsContainer.scrollTop = logsContainer.scrollHeight;
   }
 
-  renderInitialLogs();
-  // Add new log every 4-8 seconds
-  setInterval(addLiveLog, 4000 + Math.random() * 4000);
-  setTimeout(addLiveLog, 2000);
-
   // ═══════════════════════════════════════
   // ACTIVE POSITIONS TABLE
   // ═══════════════════════════════════════
   const positionsBody = document.getElementById('positionsBody');
 
-  const positions = [
-    {
-      asset: 'BTC/USDT',
-      pair: 'Bin — Byb',
-      strategy: 'Funding Rate',
-      sideLong: 'Long Bybit',
-      sideShort: 'Short Binance',
-      size: '3.00 BTC',
-      entryBybit: 68201.50,
-      entryBinance: 68205.20,
-      markPrice: 68198.80,
-      netPnl: 34.12,
-      netPnlPct: 0.11,
-      fundingPnl: 18.90,
-      durationHours: 3,
-      durationMins: 41,
-    },
-    {
-      asset: 'ETH/USDT',
-      pair: 'Bin — OKX',
-      strategy: 'Funding Rate',
-      sideLong: 'Long OKX',
-      sideShort: 'Short Binance',
-      size: '22.50 ETH',
-      entryBybit: 3842.15,
-      entryBinance: 3843.80,
-      markPrice: 3841.50,
-      netPnl: 18.75,
-      netPnlPct: 0.08,
-      fundingPnl: 12.40,
-      durationHours: 1,
-      durationMins: 18,
-    },
-    {
-      asset: 'SOL/USDT',
-      pair: 'Byb — OKX',
-      strategy: 'Funding Rate',
-      sideLong: 'Long OKX',
-      sideShort: 'Short Bybit',
-      size: '145.00 SOL',
-      entryBybit: 142.88,
-      entryBinance: 143.02,
-      markPrice: 142.95,
-      netPnl: -8.22,
-      netPnlPct: -0.04,
-      fundingPnl: 6.15,
-      durationHours: 0,
-      durationMins: 52,
-    },
-  ];
+  let positions = [];
 
   function renderPositions() {
     let html = '';
@@ -315,7 +280,7 @@
             <span class="td-side-short">${pos.sideShort}</span>
           </td>
           <td>${pos.size}</td>
-          <td>${pos.entryBybit.toFixed(2)} / ${pos.entryBinance.toFixed(2)}</td>
+          <td>${pos.entryBuy.toFixed(2)} / ${pos.entrySell.toFixed(2)}</td>
           <td>${pos.markPrice.toFixed(2)}</td>
           <td>
             <span class="pnl-badge ${pnlClass}">
@@ -323,7 +288,7 @@
             </span>
           </td>
           <td class="td-positive">+${pos.fundingPnl.toFixed(2)} USDT</td>
-          <td class="td-duration">${pos.durationHours}h ${pos.durationMins}m</td>
+          <td class="td-duration">${Math.floor((Date.now() - pos.openedAt) / 3600000)}h ${Math.floor(((Date.now() - pos.openedAt) % 3600000) / 60000)}m</td>
           <td>
             <button class="btn-close-position" data-asset="${pos.asset}">Close Position</button>
           </td>
@@ -335,69 +300,10 @@
 
   renderPositions();
 
-  // ═══════════════════════════════════════
-  // LIVE DATA SIMULATION
-  // ═══════════════════════════════════════
-  let btcBasePrice = 68205.21;
-  let walletBalance = 84310.88;
-
-  function updateLiveData() {
-    // Simulate BTC price movement
-    const priceChange = (Math.random() - 0.48) * 15; // slight upward bias
-    btcBasePrice += priceChange;
-    const pctChange = ((btcBasePrice - 67256) / 67256 * 100); // from a "yesterday" reference
-
-    const priceEl = document.getElementById('btcPrice');
-    const changeEl = document.getElementById('btcChange');
-
-    priceEl.textContent = '$' + btcBasePrice.toLocaleString('en-US', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
-
-    changeEl.textContent = (pctChange >= 0 ? '+' : '') + pctChange.toFixed(2) + '%';
-    changeEl.className = 'ticker-change ' + (pctChange >= 0 ? 'positive' : 'negative');
-
-    // Update wallet balance slightly
-    walletBalance += (Math.random() - 0.4) * 2;
-    document.getElementById('walletBalance').textContent = '$' +
-      walletBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USDT';
-
-    // Update opportunities scanned
-    const scannedEl = document.getElementById('oppsScanned');
-    const current = parseInt(scannedEl.textContent.replace(/,/g, ''));
-    scannedEl.textContent = (current + Math.floor(Math.random() * 5 + 1)).toLocaleString();
-
-    // Update positions P&L
-    for (const pos of positions) {
-      pos.netPnl += (Math.random() - 0.45) * 1.5;
-      pos.netPnlPct = pos.netPnl / (pos.strategy === 'Funding Rate' ? 30000 : 10000) * 100;
-      pos.fundingPnl += Math.random() * 0.15;
-      pos.markPrice += (Math.random() - 0.5) * 3;
-      pos.durationMins += 1;
-      if (pos.durationMins >= 60) {
-        pos.durationMins = 0;
-        pos.durationHours += 1;
-      }
-    }
-    renderPositions();
-
-    // Update daily P&L
-    const dailyPnlEl = document.getElementById('dailyPnl');
-    const totalProfitEl = document.getElementById('totalProfit');
-    const totalPnl = positions.reduce((s, p) => s + p.netPnl, 0);
-    const baseDailyPnl = 214.50 + totalPnl * 0.1;
-    dailyPnlEl.textContent = '+$' + baseDailyPnl.toFixed(2);
-
-    const baseTotalProfit = 4310.88 + totalPnl * 0.05;
-    totalProfitEl.textContent = '$' + baseTotalProfit.toLocaleString('en-US', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
-  }
-
-  // Update every 2 seconds
-  setInterval(updateLiveData, 2000);
+  // Update durations every minute
+  setInterval(() => {
+    if (positions.length > 0) renderPositions();
+  }, 60000);
 
   // ═══════════════════════════════════════
   // SIDEBAR NAVIGATION

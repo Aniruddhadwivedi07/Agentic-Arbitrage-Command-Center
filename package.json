@@ -1,0 +1,24 @@
+{
+  "name": "agentic-arbitrage-dashboard",
+  "version": "1.0.0",
+  "description": "A professional, sophisticated cryptocurrency trading system consisting of a **dark-mode React-style dashboard frontend** and a **robust asynchronous Python execution engine**. Designed for visualizing and operating an AI-driven, delta-neutral funding rate arbitrage strategy across multiple exchanges.",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aniruddhadwivedi07/Agentic-Arbitrage-Command-Center.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Aniruddhadwivedi07/Agentic-Arbitrage-Command-Center/issues"
+  },
+  "homepage": "https://github.com/Aniruddhadwivedi07/Agentic-Arbitrage-Command-Center#readme",
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
